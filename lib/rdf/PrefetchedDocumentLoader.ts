@@ -1,6 +1,5 @@
 import { FetchDocumentLoader, type IJsonLdContext } from 'jsonld-context-parser';
 import type { Logger } from 'winston';
-import fs from 'fs-extra';
 import { mver } from '../artefacts/MajorVersion.js'
 import { context } from '../artefacts/DefaultContext.js'
 
