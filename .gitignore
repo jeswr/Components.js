@@ -16,3 +16,4 @@ components/*.json
 dist/
 esm/
 cjs/
+artefacts/

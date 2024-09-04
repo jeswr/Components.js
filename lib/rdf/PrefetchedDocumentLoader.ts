@@ -1,20 +1,22 @@
 import { FetchDocumentLoader, type IJsonLdContext } from 'jsonld-context-parser';
-import semverMajor = require('semver/functions/major');
 import type { Logger } from 'winston';
+import fs from 'fs-extra';
+import { mver } from '../artefacts/MajorVersion.js'
+import { context } from '../artefacts/DefaultContext.js'
 
 /**
  * A document loader that first loads from a precomputed set of contexts,
  * and only then does an HTTP(S) lookup for the context.
  */
 export class PrefetchedDocumentLoader extends FetchDocumentLoader {
-  public static readonly CJS_MAJOR_VERSION: number = semverMajor(require('../../package.json').version);
+  public static readonly CJS_MAJOR_VERSION = mver;
   public static readonly CONTEXT_URL: string =
   `https://linkedsoftwaredependencies.org/bundles/npm/componentsjs/^${PrefetchedDocumentLoader.CJS_MAJOR_VERSION}.0.0/components/context.jsonld`;
 
   public static readonly CONTEXT_PATTERN: RegExp =
   /https:\/\/linkedsoftwaredependencies.org\/bundles\/npm\/componentsjs\/\^([0-9]+).0.0\/components\/context.jsonld/u;
 
-  private static readonly DEFAULT_CONTEXT: any = require('../../components/context.json');
+  private static readonly DEFAULT_CONTEXT: any = context;
 
   private static readonly DEFAULT_CONTEXTS: Record<string, any> = {
     [PrefetchedDocumentLoader.CONTEXT_URL]:

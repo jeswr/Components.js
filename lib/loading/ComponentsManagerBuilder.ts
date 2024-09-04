@@ -18,6 +18,7 @@ import { ConfigRegistry } from './ConfigRegistry.js';
 import { ModuleStateBuilder } from './ModuleStateBuilder.js';
 import type { IModuleState } from './ModuleStateBuilder.js';
 import { constructionStrategy } from './default/DefaultConstructionStrategy.js';
+import { context } from '../artefacts/DefaultContext.js'
 
 type Promiseish<T> = T | Promise<T>;
 
@@ -76,7 +77,7 @@ export class ComponentsManagerBuilder<Instance = any> {
   public static createObjectLoader(): RdfObjectLoader {
     return new RdfObjectLoader({
       uniqueLiterals: true,
-      context: require('../../components/context.json'),
+      context,
     });
   }
 
