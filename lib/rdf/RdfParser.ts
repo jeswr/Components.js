@@ -1,6 +1,7 @@
 import { createReadStream, promises as fs } from 'fs';
 import type { Readable } from 'stream';
 import type * as RDF from '@rdfjs/types';
+import { DataFactory } from 'n3';
 import { rdfParser, type ParseOptions } from 'rdf-parse';
 import type { Logger } from 'winston';
 import { PrefetchedDocumentLoader } from './PrefetchedDocumentLoader.js';
@@ -54,6 +55,8 @@ export class RdfParser {
       // If JSON-LD context validation should be skipped
       skipContextValidation: options.skipContextValidation,
     };
+
+    (<any> options)['@comunica/actor-init-query:dataFactory'] = DataFactory;
 
     // Execute parsing
     const quadStream = rdfParser.parse(textStream, options);

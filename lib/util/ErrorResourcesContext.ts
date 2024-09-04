@@ -26,7 +26,7 @@ export class ErrorResourcesContext extends Error {
         } else if (Array.isArray(value)) {
           mapped = value.map(valueSub => ErrorResourcesContext.resourceToJson(valueSub));
         } else if (value instanceof Resource || value === undefined) {
-          mapped = ErrorResourcesContext.resourceToJson(value);
+          mapped = ErrorResourcesContext.resourceToJson(<any> value);
         } else if ('description' in value) {
           mapped = ErrorResourcesContext.conflictToJson(<IParamValueConflict> value);
         } else {

@@ -17,6 +17,7 @@ import { ComponentRegistryFinalizer } from './ComponentRegistryFinalizer.js';
 import { ConfigRegistry } from './ConfigRegistry.js';
 import { ModuleStateBuilder } from './ModuleStateBuilder.js';
 import type { IModuleState } from './ModuleStateBuilder.js';
+import { constructionStrategy } from './default/DefaultConstructionStrategy.js';
 
 type Promiseish<T> = T | Promise<T>;
 
@@ -41,7 +42,7 @@ export class ComponentsManagerBuilder<Instance = any> {
     this.configLoader = options.configLoader || (async() => {
       // Do nothing
     });
-    this.constructionStrategy = options.constructionStrategy || new ConstructionStrategyCommonJs({ req: require });
+    this.constructionStrategy = options.constructionStrategy || constructionStrategy();
     this.dumpErrorState = options.dumpErrorState === undefined ? true : Boolean(options.dumpErrorState);
     this.logger = ComponentsManagerBuilder.createLogger(options.logLevel);
     this.moduleState = options.moduleState;

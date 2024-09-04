@@ -13,7 +13,12 @@
   ],
   "plugins": [
     [
-      "babel-plugin-add-import-extension", { "extension": "js" }
-    ]
+      "babel-plugin-add-import-extension", { "extension": "cjs" },
+    ],
+    ["module-resolver", {
+      "root": ["./"],
+      "alias": {
+        "./lib/loading/default/*": "./lib/loading/cj/*"
+      }}]
   ]
 }
