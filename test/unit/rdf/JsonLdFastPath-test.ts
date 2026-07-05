@@ -1,6 +1,6 @@
 import { PassThrough, Readable } from 'node:stream';
 import type * as RDF from '@rdfjs/types';
-import { JsonLdContextNormalized } from 'jsonld-context-parser';
+import { ContextParser, JsonLdContextNormalized } from 'jsonld-context-parser';
 import { rdfParser } from 'rdf-parse';
 import * as JsonLdFastPath from '../../../lib/rdf/JsonLdFastPath';
 import type { RdfParserOptions } from '../../../lib/rdf/RdfParser';
@@ -28,9 +28,26 @@ const RICH_CONTEXTS: Record<string, any> = {
       setTerm: { '@id': `${VOC}setTerm`, '@container': '@set' },
       doubleVal: { '@id': `${VOC}doubleVal`, '@type': 'http://www.w3.org/2001/XMLSchema#double' },
       floatVal: { '@id': `${VOC}floatVal`, '@type': 'http://www.w3.org/2001/XMLSchema#float' },
-      // Terms below carry features outside the fast path subset: documents using them fall back.
+      // Type-scoped terms: activating them via a node's @type is supported (resolved once per term).
 
       Scoped: { '@id': `${VOC}Scoped`, '@context': { nick: `${VOC}nick` }},
+
+      Scoped2: { '@id': `${VOC}Scoped2`, '@context': { nick2: `${VOC}nick2` }},
+
+      ScopedRedef: { '@id': `${VOC}ScopedRedef`, '@context': { name: `${VOC}scopedName` }},
+
+      ScopedRich: {
+        '@id': `${VOC}ScopedRich`,
+        '@context': {
+          sref: { '@id': `${VOC}sref`, '@type': '@id' },
+          slst: { '@id': `${VOC}slst`, '@container': '@list' },
+        },
+      },
+      // Terms below carry features outside the fast path subset: documents using them fall back.
+
+      PropScoped: { '@id': `${VOC}PropScoped`, '@context': { '@propagate': true, pnick: `${VOC}pnick` }},
+
+      VocabScoped: { '@id': `${VOC}VocabScoped`, '@context': { '@vocab': VOC }},
       scopedProp: { '@id': `${VOC}scopedProp`, '@context': { nick: `${VOC}nick` }},
       rev: { '@reverse': `${VOC}rev` },
       idxMap: { '@id': `${VOC}idxMap`, '@container': '@index' },
@@ -148,7 +165,10 @@ describe('JsonLdFastPath', () => {
         ctxDoc({ '@id': 'ex:s', name: { '@type': '@json', '@value': 1.5 }}),
       ],
       [ 'numeric value objects', ctxDoc({ '@id': 'ex:s', name: [{ '@value': 1 }, { '@value': 1.5 }]}) ],
-      [ 'boolean value objects', ctxDoc({ '@id': 'ex:s', name: [{ '@value': true }, { '@value': false, '@type': `${VOC}dt` }]}) ],
+      [
+        'boolean value objects',
+        ctxDoc({ '@id': 'ex:s', name: [{ '@value': true }, { '@value': false, '@type': `${VOC}dt` }]}),
+      ],
       [ 'integers', ctxDoc({ '@id': 'ex:s', name: [ 0, 7, -42 ]}) ],
       [ 'doubles', ctxDoc({ '@id': 'ex:s', name: [ 1.5, -0.25 ]}) ],
       [ 'huge integers becoming doubles', ctxDoc({ '@id': 'ex:s', name: 1e22 }) ],
@@ -174,6 +194,45 @@ describe('JsonLdFastPath', () => {
       [ 'lists of node objects', ctxDoc({ '@id': 'ex:s', myList: [{ '@id': 'ex:o', name: 'x' }]}) ],
       [ 'set containers', ctxDoc({ '@id': 'ex:s', setTerm: [ 'a', 'b' ]}) ],
       [ 'an array context with a single URL', { '@context': [ CTX_URL ], '@id': 'ex:s', name: 'x' }],
+      [ 'top-level @graph arrays', ctxDoc({ '@graph': [{ '@id': 'ex:s', name: 'x' }, { '@id': 'ex:o', name: 'y' }]}) ],
+      [ 'top-level @graph objects', ctxDoc({ '@graph': { '@id': 'ex:s', name: 'x' }}) ],
+      [ 'empty top-level @graph arrays', ctxDoc({ '@graph': []}) ],
+      [ 'named graphs from nodes with properties', ctxDoc({ name: 'root', '@graph': [{ '@id': 'ex:s', name: 'x' }]}) ],
+      [
+        'named graphs from identified nodes',
+        ctxDoc({ '@id': 'ex:g', name: 'root', '@graph': [{ '@id': 'ex:s', name: 'x' }]}),
+      ],
+      [ 'named graphs from @id-only nodes', ctxDoc({ '@id': 'ex:g', '@graph': [{ '@id': 'ex:s', name: 'x' }]}) ],
+      [
+        'lists inside named graphs',
+        ctxDoc({ name: 'root', '@graph': [{ '@id': 'ex:s', myList: [ 'a', { '@id': 'ex:o', name: 'i' }]}]}),
+      ],
+      [ 'type-scoped context activation', ctxDoc({ '@id': 'ex:s', '@type': 'Scoped', nick: 'x' }) ],
+      [
+        'type-scoped activation next to base terms',
+        ctxDoc({ '@id': 'ex:s', '@type': 'Scoped', nick: 'x', name: 'y' }),
+      ],
+      [
+        'type-scoped redefinition of base terms',
+        ctxDoc({ '@id': 'ex:s', '@type': 'ScopedRedef', name: 'redefined' }),
+      ],
+      [
+        'non-propagation of type-scoped contexts to nested nodes',
+        ctxDoc({ '@id': 'ex:s', '@type': 'ScopedRedef', ref: { '@id': 'ex:o', name: 'base-meaning' }}),
+      ],
+      [
+        'coercion and list containers in type-scoped contexts',
+        ctxDoc({ '@id': 'ex:s', '@type': 'ScopedRich', sref: 'ex:o', slst: [ 'a', 'b' ]}),
+      ],
+      [ 'scoped types alongside plain types', ctxDoc({ '@id': 'ex:s', '@type': [ 'Scoped', 'ex:T' ], nick: 'x' }) ],
+      [
+        'repeated type-scoped activation across nodes',
+        ctxDoc({ '@graph': [
+          { '@id': 'ex:s', '@type': 'Scoped', nick: 'x' },
+          { '@id': 'ex:o', '@type': 'Scoped', nick: 'y' },
+        ]}),
+      ],
+      [ 'explicit @list objects under list containers', ctxDoc({ '@id': 'ex:s', myList: { '@list': [ 'a', 1 ]}}) ],
     ])('should fast-path %s identically to the generic parser', async(label, doc) => {
       const { tookFast } = await expectParity(doc);
       expect(tookFast).toBe(true);
@@ -207,7 +266,6 @@ describe('JsonLdFastPath', () => {
 
   describe('falling back for documents outside the supported subset', () => {
     it.each(<[string, any][]> [
-      [ '@graph documents', ctxDoc({ '@graph': [{ '@id': 'ex:s', name: 'x' }]}) ],
       [ '@language value objects', ctxDoc({ '@id': 'ex:s', name: { '@value': 'x', '@language': 'en' }}) ],
       [ '@reverse usage', ctxDoc({ '@id': 'ex:s', '@reverse': { name: { '@id': 'ex:o' }}}) ],
       [ '@index usage', ctxDoc({ '@id': 'ex:s', name: { '@value': 'x', '@index': 'i' }}) ],
@@ -221,7 +279,20 @@ describe('JsonLdFastPath', () => {
       [ 'non-object roots', '"just a string"' ],
       [ 'null roots', 'null' ],
       [ 'unsafe terms: type-scoped contexts as key', ctxDoc({ '@id': 'ex:s', Scoped: 'x' }) ],
-      [ 'unsafe terms: type-scoped contexts as type', ctxDoc({ '@id': 'ex:s', '@type': 'Scoped', name: 'x' }) ],
+      [ 'multiple type-scoped types', ctxDoc({ '@id': 'ex:s', '@type': [ 'Scoped', 'Scoped2' ], nick: 'x' }) ],
+      [ 'propagating type-scoped contexts', ctxDoc({ '@id': 'ex:s', '@type': 'PropScoped', pnick: 'x' }) ],
+      [ 'type-scoped contexts declaring @vocab', ctxDoc({ '@id': 'ex:s', '@type': 'VocabScoped', name: 'x' }) ],
+      [ 'unsafe keys within type-scoped nodes', ctxDoc({ '@id': 'ex:s', '@type': 'Scoped', scopedProp: 'x' }) ],
+      [ 'nested @graph keys', ctxDoc({ '@id': 'ex:s', name: { '@graph': []}}) ],
+      [ '@graph with scalar entries', ctxDoc({ '@graph': [ 'x' ]}) ],
+      [ '@graph with array entries', ctxDoc({ '@graph': [[]]}) ],
+      [ '@graph with null entries', ctxDoc({ '@graph': [ null ]}) ],
+      [ 'null-valued root properties next to @graph', ctxDoc({ name: null, '@graph': []}) ],
+      [ 'empty-array root properties next to @graph', ctxDoc({ name: [], '@graph': []}) ],
+      [
+        '@list objects with extra keys under list containers',
+        ctxDoc({ '@id': 'ex:s', myList: { '@list': [ 'a' ], 'ex:p': 'x' }}),
+      ],
       [ 'unsafe terms: property-scoped contexts', ctxDoc({ '@id': 'ex:s', scopedProp: { name: 'x' }}) ],
       [ 'unsafe terms: reverse terms', ctxDoc({ '@id': 'ex:s', rev: { '@id': 'ex:o' }}) ],
       [ 'unsafe terms: index containers', ctxDoc({ '@id': 'ex:s', idxMap: { i: 'x' }}) ],
@@ -305,6 +376,35 @@ describe('JsonLdFastPath', () => {
         { '@context': 'http://example.org/unknown-context.jsonld', '@id': `${VOC}s`, p: 'x' },
       );
       expect(tookFast).toBe(false);
+    });
+
+    it('should fall back when type-scoped context resolution errors', async() => {
+      const contexts = {
+        'http://example.org/scopederr.jsonld': {
+          '@context': { name: `${VOC}name`, T: { '@id': `${VOC}T`, '@context': { nick: `${VOC}nick` }}},
+        },
+      };
+      const original = ContextParser.prototype.parse;
+      const spy = jest.spyOn(ContextParser.prototype, 'parse')
+        .mockImplementation(<any> function(this: any, ...args: any[]) {
+          // Only the fast path's scoped-context resolution matches this signature:
+          // the generic parser and jsonld-context-parser internals pass baseIRI,
+          // external, or minimalProcessing alongside parentContext.
+          if (args[1] && args[1].parentContext && !('baseIRI' in args[1]) &&
+            !('external' in args[1]) && !args[1].minimalProcessing) {
+            throw new Error('scope resolution failure');
+          }
+          return original.apply(this, <any> args);
+        });
+      try {
+        const { tookFast } = await expectParity(
+          { '@context': 'http://example.org/scopederr.jsonld', '@id': `${VOC}s`, '@type': 'T', nick: 'x' },
+          contexts,
+        );
+        expect(tookFast).toBe(false);
+      } finally {
+        spy.mockRestore();
+      }
     });
 
     it('should fall back when vocab-mode term expansion errors', async() => {

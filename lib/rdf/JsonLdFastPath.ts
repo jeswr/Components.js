@@ -2,8 +2,7 @@ import type * as RDF from '@rdfjs/types';
 
 // eslint-disable-next-line ts/no-require-imports
 import canonicalizeJsonModule = require('canonicalize');
-import type { JsonLdContextNormalized } from 'jsonld-context-parser';
-import { ContextParser, Util as ContextUtil } from 'jsonld-context-parser';
+import { ContextParser, JsonLdContextNormalized, Util as ContextUtil } from 'jsonld-context-parser';
 import { DataFactory } from 'rdf-data-factory';
 import { IRIS_RDF, IRIS_XSD, PREFIX_RDF } from './Iris';
 import { PrefetchedDocumentLoader } from './PrefetchedDocumentLoader';
@@ -35,7 +34,7 @@ const EXPAND_OPTIONS = {
  * a false positive merely costs performance, never correctness.
  */
 // eslint-disable-next-line max-len
-const UNSUPPORTED_DOC_PATTERN = /"@(?:graph|reverse|index|nest|included|direction|base|vocab|language|set|container|prefix|version|propagate|protected|import|annotation|none)"\s*:/u;
+const UNSUPPORTED_DOC_PATTERN = /"@(?:reverse|index|nest|included|direction|base|vocab|language|set|container|prefix|version|propagate|protected|import|annotation|none)"\s*:/u;
 
 /**
  * Matches all occurrences of the `@context` keyword, used to detect (unsupported) non-root contexts.
@@ -52,7 +51,8 @@ class FastPathBailout extends Error {
 }
 
 /**
- * The pre-analyzed state of a normalized JSON-LD context, reused across all documents sharing that context.
+ * The pre-analyzed state of a normalized JSON-LD context,
+ * reused across all documents (and, for type-scoped states, all nodes) sharing that context.
  */
 interface IFastPathContextEntry {
   /**
@@ -64,11 +64,29 @@ interface IFastPathContextEntry {
    */
   dict: Record<string, any>;
   /**
-   * Terms whose definitions carry JSON-LD features the fast path cannot honour
-   * (property-/type-scoped contexts, reverse properties, non-list containers, ...).
-   * Any document using one of these terms as a key or `@type` value falls back to the generic parser.
+   * Terms whose definitions carry JSON-LD features the fast path cannot honour when the term
+   * is used as a key (scoped contexts, reverse properties, non-list containers, ...).
+   * Any document using one of these terms as a key falls back to the generic parser;
+   * for `@type` values, {@link IFastPathContextEntry.scopedTerms} takes precedence.
    */
   unsafeTerms: Set<string>;
+  /**
+   * Terms whose definitions carry a (type-)scoped context.
+   * Using such a term as a node's single `@type` activates the corresponding entry in
+   * {@link IFastPathContextEntry.scopedEntries} for that node (and only that node,
+   * mirroring JSON-LD 1.1 non-propagating type-scoped contexts).
+   */
+  scopedTerms: Set<string>;
+  /**
+   * The pre-resolved context entries for used type-scoped terms:
+   * the scoped context merged over this context (once per term, instead of once per node),
+   * or `null` when the scoped context is outside the supported subset.
+   */
+  scopedEntries: Map<string, IFastPathContextEntry | null>;
+  /**
+   * The context parser to resolve scoped contexts with (only set on root entries).
+   */
+  contextParser?: ContextParser;
   /**
    * Memoized vocab-mode term-to-IRI expansions (`expandTerm(term, true)`).
    * `null` means the term expands to nothing (dropped);
@@ -126,20 +144,26 @@ export function isJsonLdFastPathCandidate(options: RdfParserOptions): boolean {
  * The generic streaming pipeline pays per-value async handler dispatch and per-document parser
  * construction for flexibility these documents never use.
  * This fast path normalizes each distinct context ONCE (with the real, spec-compliant
- * {@link ContextParser}), and then converts documents with a plain synchronous recursive walk.
+ * {@link ContextParser}), resolves each used type-scoped context ONCE per (context, term)
+ * (instead of once per typed node), and then converts documents with a plain synchronous
+ * recursive walk.
  *
  * Correctness contract: this is NOT a general JSON-LD processor.
  * This function inspects each document (and its context) and returns `undefined`
  * whenever the document could use any feature outside the implemented subset,
  * in which case the caller MUST fall back to the generic parser.
  * Term-to-IRI expansion is delegated to (memoized) jsonld-context-parser `expandTerm` calls,
- * so IRI semantics are identical to the generic parser by construction.
+ * and scoped contexts are resolved with the real {@link ContextParser},
+ * so context semantics are identical to the generic parser by construction.
  *
  * The implemented subset: root-level `@context` (URLs resolvable from the prefetched contexts),
- * `@id`, `@type`, `@value` (with `@type`, including `@json`), `@list` (and `@container: @list` terms),
+ * root-level `@graph` (including the named-graph form used by componentsjs config files),
+ * `@id`, `@type` (including single non-propagating type-scoped context activation),
+ * `@value` (with `@type`, including `@json`), `@list` (and `@container: @list` terms),
  * `@type: @id` term coercion, datatype coercion, compact IRIs, blank nodes, numbers, booleans and null.
- * Documents (potentially) using anything else — `@graph`, `@reverse`, `@language`, `@index`, `@nest`,
- * `@base`, `@vocab`, nested contexts, scoped contexts, relative IRIs, ... — fall back.
+ * Documents (potentially) using anything else — `@reverse`, `@language`, `@index`, `@nest`,
+ * `@base`, `@vocab`, nested `@graph`s or contexts, property-scoped or propagating scoped contexts,
+ * relative IRIs, ... — fall back.
  * @param text The full document text.
  * @param options RDF parser options.
  * @returns The document's quads, or `undefined` if the document is outside the supported
@@ -166,6 +190,7 @@ export async function tryParseJsonLdFastPath(text: string, options: RdfParserOpt
   if (!entry) {
     return;
   }
+  await ensureScopedTypeEntries(document, entry);
 
   try {
     return new FastPathConverter(entry, documentCounter++).convertDocument(document);
@@ -209,7 +234,7 @@ async function getContextEntry(
 }
 
 /**
- * Normalize and analyze a context.
+ * Normalize and analyze a root context.
  * @param contextValue The document's root `@context` value.
  * @param options RDF parser options.
  */
@@ -217,23 +242,37 @@ async function buildContextEntry(
   contextValue: any,
   options: RdfParserOptions,
 ): Promise<IFastPathContextEntry | undefined> {
+  const contextParser = new ContextParser({
+    documentLoader: new PrefetchedDocumentLoader({
+      contexts: options.contexts!,
+      remoteContextLookups: false,
+    }),
+    skipValidation: options.skipContextValidation,
+  });
   let context: JsonLdContextNormalized;
   try {
     // Remote lookups are never allowed here; contexts requiring them fall back to
     // the generic parser, which implements the configured remote lookup behaviour.
-    context = await new ContextParser({
-      documentLoader: new PrefetchedDocumentLoader({
-        contexts: options.contexts!,
-        remoteContextLookups: false,
-      }),
-      skipValidation: options.skipContextValidation,
-    }).parse(contextValue);
+    context = await contextParser.parse(contextValue);
   } catch {
     return;
   }
+  const entry = analyzeNormalizedContext(context);
+  if (entry) {
+    entry.contextParser = contextParser;
+  }
+  return entry;
+}
 
+/**
+ * Analyze a normalized context into a fast-path context entry.
+ * @param context A normalized context.
+ * @returns The analyzed entry, or `undefined` if the context is outside the supported subset.
+ */
+function analyzeNormalizedContext(context: JsonLdContextNormalized): IFastPathContextEntry | undefined {
   const dict = context.getContextRaw();
   const unsafeTerms = new Set<string>();
+  const scopedTerms = new Set<string>();
   for (const term of Object.keys(dict)) {
     if (term.startsWith('@')) {
       // Context-level keywords: only the processing-mode version marker is supported.
@@ -251,9 +290,12 @@ async function buildContextEntry(
       }
       continue;
     }
+    if (typeof definition === 'object' && '@context' in definition) {
+      scopedTerms.add(term);
+    }
     if (
       typeof definition !== 'object' ||
-      // Scoped contexts, reverse properties, language/direction defaults,
+      // Scoped contexts (when used as a key), reverse properties, language/direction defaults,
       // and index/nest maps are out of subset.
       '@context' in definition || '@reverse' in definition || '@language' in definition ||
       '@direction' in definition || '@index' in definition || '@nest' in definition ||
@@ -275,10 +317,91 @@ async function buildContextEntry(
     context,
     dict,
     unsafeTerms,
+    scopedTerms,
+    scopedEntries: new Map(),
     vocabIris: new Map(),
     baseIris: new Map(),
     typeIris: new Map(),
   };
+}
+
+/**
+ * Pre-resolve the scoped-context entries for all type-scoped terms the given document uses,
+ * once per (context, term) — the generic parser re-resolves these per typed node.
+ * @param document A parsed JSON-LD document.
+ * @param entry The document's root context entry.
+ */
+async function ensureScopedTypeEntries(document: any, entry: IFastPathContextEntry): Promise<void> {
+  if (entry.scopedTerms.size === 0) {
+    return;
+  }
+  const used = new Set<string>();
+  collectScopedTypeTerms(document, entry, used);
+  for (const term of used) {
+    if (!entry.scopedEntries.has(term)) {
+      entry.scopedEntries.set(term, await resolveScopedEntry(entry, term));
+    }
+  }
+}
+
+/**
+ * Collect all `@type` values in the document that name type-scoped terms.
+ * @param value Any JSON value within the document.
+ * @param entry The document's root context entry.
+ * @param used The set to collect used type-scoped terms into.
+ */
+function collectScopedTypeTerms(value: any, entry: IFastPathContextEntry, used: Set<string>): void {
+  if (Array.isArray(value)) {
+    for (const element of value) {
+      collectScopedTypeTerms(element, entry, used);
+    }
+    return;
+  }
+  if (!value || typeof value !== 'object') {
+    return;
+  }
+  const types = value['@type'];
+  for (const type of Array.isArray(types) ? types : [ types ]) {
+    if (typeof type === 'string' && entry.scopedTerms.has(type)) {
+      used.add(type);
+    }
+  }
+  for (const key of Object.keys(value)) {
+    collectScopedTypeTerms(value[key], entry, used);
+  }
+}
+
+/**
+ * Resolve the context entry for a type-scoped term: the term's scoped context merged over the
+ * root context, using the same context parser and options as the generic parser.
+ * @param entry The root context entry.
+ * @param term A type-scoped term.
+ * @returns The merged entry, or `null` when the scoped context is outside the supported subset.
+ */
+async function resolveScopedEntry(entry: IFastPathContextEntry, term: string): Promise<IFastPathContextEntry | null> {
+  const scopedContext = entry.dict[term]['@context'];
+  if (JSON.stringify(scopedContext).includes('"@propagate"')) {
+    // Propagating scoped contexts stay active for nested nodes; out of subset.
+    return null;
+  }
+  let merged: JsonLdContextNormalized;
+  try {
+    // Mirrors the generic parser's type-scoped ParsingContext.parseContext invocation,
+    // except that no base IRI is threaded in: the fast path never resolves relative IRIs
+    // (it falls back on them), so the merged context can be shared across documents.
+    merged = await entry.contextParser!.parse(scopedContext, {
+      parentContext: entry.dict,
+      processingMode: 1.1,
+    });
+  } catch {
+    return null;
+  }
+  // Inner contexts carry a baked-in base document marker from context preprocessing;
+  // strip it, as the fast path falls back on anything base-dependent anyway.
+  const dict = { ...merged.getContextRaw() };
+  delete dict['@base'];
+  delete dict['@__baseDocument'];
+  return analyzeNormalizedContext(new JsonLdContextNormalized(dict)) ?? null;
 }
 
 /**
@@ -299,69 +422,121 @@ class FastPathConverter {
 
   /**
    * Convert the given document, throwing {@link FastPathBailout} if it is outside the supported subset.
-   * @param document A parsed JSON-LD document (a root node object).
+   * @param document A parsed JSON-LD document (a root node object, optionally carrying `@graph`).
    */
   public convertDocument(document: any): RDF.Quad[] {
     // The root context was already consumed by the context analysis.
     delete document['@context'];
-    this.convertNode(document);
+    let graph: RDF.Quad_Graph = this.dataFactory.defaultGraph();
+    if (!('@graph' in document)) {
+      this.convertNode(document, graph);
+      return this.quads;
+    }
+    const graphContent = document['@graph'];
+    delete document['@graph'];
+    if (Object.keys(document).length > 0) {
+      // A node carrying both properties (or an @id) and @graph names the graph after itself:
+      // its own quads go to the default graph, the @graph contents into the named graph.
+      for (const value of Object.values(document)) {
+        if (value === null || (Array.isArray(value) && value.length === 0)) {
+          // Whether an all-dropped node still names the graph is a corner case
+          // the generic parser decides.
+          throw new FastPathBailout();
+        }
+      }
+      graph = this.convertNode(document, this.dataFactory.defaultGraph());
+    }
+    for (const node of Array.isArray(graphContent) ? graphContent : [ graphContent ]) {
+      if (!node || typeof node !== 'object' || Array.isArray(node)) {
+        throw new FastPathBailout();
+      }
+      this.convertNode(node, graph);
+    }
     return this.quads;
   }
 
   /**
    * Emit all quads for the given node object, and return the term identifying it.
    * @param node A node object.
+   * @param graph The graph to emit into.
    */
-  private convertNode(node: Record<string, any>): RDF.NamedNode | RDF.BlankNode {
+  private convertNode(node: Record<string, any>, graph: RDF.Quad_Graph): RDF.NamedNode | RDF.BlankNode {
     const id = node['@id'];
     if (id !== undefined && typeof id !== 'string') {
       throw new FastPathBailout();
     }
-    const subject = id === undefined ? this.blankNode() : this.termForId(id);
+
+    // Determine the node's active context: a single type-scoped term activates its
+    // (pre-resolved) merged context for this node only; nested nodes revert to the root
+    // context, mirroring JSON-LD 1.1 non-propagating type-scoped contexts.
+    let nodeEntry = this.entry;
+    const rawTypes = node['@type'];
+    const types: any[] = rawTypes === undefined ? [] : (Array.isArray(rawTypes) ? rawTypes : [ rawTypes ]);
+    let scopedType: string | undefined;
+    for (const type of types) {
+      if (typeof type !== 'string' || type.startsWith('_:')) {
+        // Blank node types are handled by the generic parser.
+        throw new FastPathBailout();
+      }
+      if (this.entry.scopedTerms.has(type)) {
+        if (scopedType !== undefined) {
+          // Multiple scoped contexts on one node are chained by the generic parser.
+          throw new FastPathBailout();
+        }
+        scopedType = type;
+      } else if (this.entry.unsafeTerms.has(type)) {
+        throw new FastPathBailout();
+      }
+    }
+    if (scopedType !== undefined) {
+      const scopedEntry = this.entry.scopedEntries.get(scopedType);
+      if (!scopedEntry) {
+        throw new FastPathBailout();
+      }
+      nodeEntry = scopedEntry;
+    }
+
+    const subject = id === undefined ? this.blankNode() : this.termForId(id, nodeEntry);
+    // Type values expand against the pre-scope context, mirroring the generic parser.
+    this.emitTypes(subject, types, graph);
 
     for (const key of Object.keys(node)) {
-      if (key === '@id') {
+      if (key === '@id' || key === '@type') {
         continue;
       }
-      if (key === '@type') {
-        this.emitTypes(subject, node[key]);
-        continue;
-      }
-      if (key.startsWith('@') || this.entry.unsafeTerms.has(key)) {
+      if (key.startsWith('@') || nodeEntry.unsafeTerms.has(key)) {
         // Any other keyword (or keyword-like key), and any term whose definition is out of
         // subset (e.g. a property-scoped context), aborts to the generic parser.
         throw new FastPathBailout();
       }
-      const predicateIri = this.expandVocab(key);
+      const predicateIri = this.expandVocab(key, nodeEntry);
       if (!predicateIri || predicateIri.startsWith('@') || predicateIri.startsWith('_:') ||
         !ContextUtil.isValidIri(predicateIri)) {
         // The generic parser drops or errors on these; it decides.
         throw new FastPathBailout();
       }
-      const definition = this.entry.dict[key];
+      const definition = nodeEntry.dict[key];
       this.emitProperty(
         subject,
         this.dataFactory.namedNode(predicateIri),
         node[key],
         typeof definition === 'object' ? definition : undefined,
+        nodeEntry,
+        graph,
       );
     }
     return subject;
   }
 
   /**
-   * Emit `rdf:type` quads for the given `@type` value.
+   * Emit `rdf:type` quads for the given (pre-vetted) `@type` values.
    * @param subject The node's subject term.
-   * @param types The raw `@type` value.
+   * @param types The node's `@type` values.
+   * @param graph The graph to emit into.
    */
-  private emitTypes(subject: RDF.NamedNode | RDF.BlankNode, types: any): void {
-    for (const type of Array.isArray(types) ? types : [ types ]) {
-      if (typeof type !== 'string' || type.startsWith('_:') || this.entry.unsafeTerms.has(type)) {
-        // Blank node types and types that would activate a type-scoped context
-        // are handled by the generic parser.
-        throw new FastPathBailout();
-      }
-      const iri = this.expandTypeIri(type);
+  private emitTypes(subject: RDF.NamedNode | RDF.BlankNode, types: string[], graph: RDF.Quad_Graph): void {
+    for (const type of types) {
+      const iri = this.expandTypeIri(type, this.entry);
       if (iri === null || iri.startsWith('@')) {
         // Mirrors the generic parser: types expanding to keywords are skipped silently.
         continue;
@@ -373,6 +548,7 @@ class FastPathConverter {
         subject,
         this.dataFactory.namedNode(IRIS_RDF.type),
         this.dataFactory.namedNode(iri),
+        graph,
       ));
     }
   }
@@ -383,16 +559,20 @@ class FastPathConverter {
    * @param predicate The property's predicate term.
    * @param value The property's raw value.
    * @param definition The property's term definition, if it is an expanded term definition.
+   * @param entry The context entry the property was resolved against.
+   * @param graph The graph to emit into.
    */
   private emitProperty(
     subject: RDF.NamedNode | RDF.BlankNode,
     predicate: RDF.NamedNode,
     value: any,
     definition: Record<string, any> | undefined,
+    entry: IFastPathContextEntry,
+    graph: RDF.Quad_Graph,
   ): void {
     // JSON-typed terms capture their full raw value as a single JSON literal.
     if (definition && definition['@type'] === '@json') {
-      this.quads.push(this.dataFactory.quad(subject, predicate, this.jsonLiteral(value)));
+      this.quads.push(this.dataFactory.quad(subject, predicate, this.jsonLiteral(value), graph));
       return;
     }
     if (value === null) {
@@ -400,7 +580,20 @@ class FastPathConverter {
       return;
     }
     if (definition && definition['@container'] && definition['@container']['@list']) {
-      this.quads.push(this.dataFactory.quad(subject, predicate, this.listToTerm(value, definition)));
+      // An explicit @list object under a list container IS the list (no double wrapping).
+      let listValue = value;
+      if (typeof listValue === 'object' && !Array.isArray(listValue) && '@list' in listValue) {
+        if (Object.keys(listValue).length > 1) {
+          throw new FastPathBailout();
+        }
+        listValue = listValue['@list'];
+      }
+      this.quads.push(this.dataFactory.quad(
+        subject,
+        predicate,
+        this.listToTerm(listValue, definition, entry, graph),
+        graph,
+      ));
       return;
     }
     if (Array.isArray(value)) {
@@ -409,16 +602,16 @@ class FastPathConverter {
           // Nested-array flattening is left to the generic parser.
           throw new FastPathBailout();
         }
-        const term = this.valueToTerm(element, definition);
+        const term = this.valueToTerm(element, definition, entry, graph);
         if (term) {
-          this.quads.push(this.dataFactory.quad(subject, predicate, term));
+          this.quads.push(this.dataFactory.quad(subject, predicate, term, graph));
         }
       }
       return;
     }
-    const term = this.valueToTerm(value, definition);
+    const term = this.valueToTerm(value, definition, entry, graph);
     if (term) {
-      this.quads.push(this.dataFactory.quad(subject, predicate, term));
+      this.quads.push(this.dataFactory.quad(subject, predicate, term, graph));
     }
   }
 
@@ -427,17 +620,21 @@ class FastPathConverter {
    * emitting quads for nested node objects and lists along the way.
    * @param value A raw property value.
    * @param definition The property's term definition, if it is an expanded term definition.
+   * @param entry The context entry the property was resolved against.
+   * @param graph The graph to emit into.
    * @returns The value's term, or `undefined` if the value is dropped (JSON-LD null semantics).
    */
   private valueToTerm(
     value: any,
     definition: Record<string, any> | undefined,
+    entry: IFastPathContextEntry,
+    graph: RDF.Quad_Graph,
   ): RDF.NamedNode | RDF.BlankNode | RDF.Literal | undefined {
     const coercion: string | undefined = definition ? definition['@type'] : undefined;
     switch (typeof value) {
       case 'string':
         if (coercion === '@id') {
-          return this.termForId(value);
+          return this.termForId(value, entry);
         }
         return coercion === undefined ?
           this.dataFactory.literal(value) :
@@ -456,24 +653,26 @@ class FastPathConverter {
         }
         // Note: value is never an array here; all callers handle (and pre-check) arrays.
         if ('@value' in value) {
-          return this.valueObjectToTerm(value);
+          return this.valueObjectToTerm(value, entry);
         }
         if ('@list' in value) {
           if (Object.keys(value).length > 1) {
             throw new FastPathBailout();
           }
-          return this.listToTerm(value['@list'], definition);
+          return this.listToTerm(value['@list'], definition, entry, graph);
         }
-        return this.convertNode(value);
+        // Nested node objects revert to the root context (type-scoped contexts do not propagate).
+        return this.convertNode(value, graph);
     }
   }
 
   /**
    * Convert a value object (`@value`) into a term.
    * @param value A value object.
+   * @param entry The context entry the surrounding property was resolved against.
    * @returns The value's term, or `undefined` if the value is dropped (JSON-LD null semantics).
    */
-  private valueObjectToTerm(value: Record<string, any>): RDF.Literal | undefined {
+  private valueObjectToTerm(value: Record<string, any>, entry: IFastPathContextEntry): RDF.Literal | undefined {
     const keys = Object.keys(value);
     if (value['@type'] === '@json') {
       // The generic (streaming) parser only reliably recognizes JSON values when the `@type`
@@ -500,7 +699,7 @@ class FastPathConverter {
       if (typeof type !== 'string' || type.startsWith('@')) {
         throw new FastPathBailout();
       }
-      const iri = this.expandTypeIri(type);
+      const iri = this.expandTypeIri(type, entry);
       if (!iri || !ContextUtil.isValidIri(iri)) {
         throw new FastPathBailout();
       }
@@ -561,8 +760,15 @@ class FastPathConverter {
    * Build an RDF list for the given raw `@list` value, and return its head term.
    * @param value The raw list value.
    * @param definition The property's term definition, if it is an expanded term definition.
+   * @param entry The context entry the property was resolved against.
+   * @param graph The graph to emit into.
    */
-  private listToTerm(value: any, definition: Record<string, any> | undefined): RDF.NamedNode | RDF.BlankNode {
+  private listToTerm(
+    value: any,
+    definition: Record<string, any> | undefined,
+    entry: IFastPathContextEntry,
+    graph: RDF.Quad_Graph,
+  ): RDF.NamedNode | RDF.BlankNode {
     const elements = Array.isArray(value) ? value : [ value ];
     let head: RDF.NamedNode | RDF.BlankNode = this.dataFactory.namedNode(IRI_RDF_NIL);
     for (let i = elements.length - 1; i >= 0; i--) {
@@ -570,11 +776,13 @@ class FastPathConverter {
         // Lists of lists are left to the generic parser.
         throw new FastPathBailout();
       }
-      const term = this.valueToTerm(elements[i], definition);
+      const term = this.valueToTerm(elements[i], definition, entry, graph);
       if (!term) {
         // Null list elements are dropped.
         continue;
       }
+      // The generic parser always emits list cells into the default graph,
+      // even inside named graphs (while member node quads follow the active graph).
       const cell = this.blankNode();
       this.quads.push(this.dataFactory.quad(cell, this.dataFactory.namedNode(IRI_RDF_FIRST), term));
       this.quads.push(this.dataFactory.quad(cell, this.dataFactory.namedNode(IRI_RDF_REST), head));
@@ -609,12 +817,13 @@ class FastPathConverter {
   /**
    * Convert an `@id` (or `@type: @id`-coerced) string into a term.
    * @param value An identifier string.
+   * @param entry The context entry to expand against.
    */
-  private termForId(value: string): RDF.NamedNode | RDF.BlankNode {
+  private termForId(value: string, entry: IFastPathContextEntry): RDF.NamedNode | RDF.BlankNode {
     if (value.startsWith('_:')) {
       return this.dataFactory.blankNode(value.slice(2));
     }
-    const iri = this.expandBase(value);
+    const iri = this.expandBase(value, entry);
     if (!iri || !ContextUtil.isValidIri(iri)) {
       // Notably: relative IRIs, which the generic parser resolves against the base IRI.
       throw new FastPathBailout();
@@ -633,18 +842,19 @@ class FastPathConverter {
   /**
    * Memoized vocab-mode term expansion, mirroring the generic parser's predicate expansion.
    * @param term A term.
+   * @param entry The context entry to expand against.
    * @returns The expanded IRI, or `null` when expansion fails
    *          (in which case the generic parser implements the exact drop/error behaviour).
    */
-  private expandVocab(term: string): string | null {
-    let iri = this.entry.vocabIris.get(term);
+  private expandVocab(term: string, entry: IFastPathContextEntry): string | null {
+    let iri = entry.vocabIris.get(term);
     if (iri === undefined) {
       try {
-        iri = this.entry.context.expandTerm(term, true, EXPAND_OPTIONS);
+        iri = entry.context.expandTerm(term, true, EXPAND_OPTIONS);
       } catch {
         iri = false;
       }
-      this.entry.vocabIris.set(term, iri);
+      entry.vocabIris.set(term, iri);
     }
     if (iri === false) {
       throw new FastPathBailout();
@@ -655,17 +865,18 @@ class FastPathConverter {
   /**
    * Memoized base-mode term expansion, mirroring the generic parser's resource expansion.
    * @param term A term.
+   * @param entry The context entry to expand against.
    * @returns The expanded IRI, or `null` when expansion fails.
    */
-  private expandBase(term: string): string | null {
-    let iri = this.entry.baseIris.get(term);
+  private expandBase(term: string, entry: IFastPathContextEntry): string | null {
+    let iri = entry.baseIris.get(term);
     if (iri === undefined) {
       try {
-        iri = this.entry.context.expandTerm(term, false, EXPAND_OPTIONS);
+        iri = entry.context.expandTerm(term, false, EXPAND_OPTIONS);
       } catch {
         iri = false;
       }
-      this.entry.baseIris.set(term, iri);
+      entry.baseIris.set(term, iri);
     }
     if (iri === false) {
       throw new FastPathBailout();
@@ -677,16 +888,17 @@ class FastPathConverter {
    * Memoized `@type`-value expansion, mirroring the generic parser's
    * vocab-mode-with-base-mode-fallback expansion of type IRIs.
    * @param term A term.
+   * @param entry The context entry to expand against.
    * @returns The expanded IRI, or `null` when expansion fails.
    */
-  private expandTypeIri(term: string): string | null {
-    let iri = this.entry.typeIris.get(term);
+  private expandTypeIri(term: string, entry: IFastPathContextEntry): string | null {
+    let iri = entry.typeIris.get(term);
     if (iri === undefined) {
-      iri = this.expandVocab(term);
+      iri = this.expandVocab(term, entry);
       if (iri === term) {
-        iri = this.expandBase(term);
+        iri = this.expandBase(term, entry);
       }
-      this.entry.typeIris.set(term, iri);
+      entry.typeIris.set(term, iri);
     }
     return iri;
   }
