@@ -115,7 +115,8 @@ export class ModuleStateBuilder {
 
         // Recursively handle all the Node modules of this valid Node module
         const dependenciesPath = Path.posix.join(path, 'node_modules');
-        for (const dependency of await fs.readdir(dependenciesPath)) {
+        const dependencies = await fs.readdir(dependenciesPath);
+        await Promise.all(dependencies.map(async(dependency) => {
           // Ignore hidden folders, such as .bin
           if (!dependency.startsWith('.')) {
             const dependencyPath = Path.posix.join(dependenciesPath, dependency);
@@ -131,7 +132,7 @@ export class ModuleStateBuilder {
               await this.buildNodeModulePathsInner(dependencyPath, nodeModulePaths, ignorePaths);
             }
           }
-        }
+        }));
       }
     } catch {
       // Ignore invalid paths
@@ -155,9 +156,16 @@ export class ModuleStateBuilder {
     const packageJsons: Record<string, any> = {};
     await Promise.all(nodeModulePaths.map(async(modulePath) => {
       const path = Path.posix.join(modulePath, 'package.json');
-      if (await this.fileExists(path)) {
-        packageJsons[modulePath] = JSON.parse(await fs.readFile(path, 'utf8'));
+      // Try the read directly instead of checking existence first,
+      // which halves the number of file system operations.
+      let contents: string;
+      try {
+        contents = await fs.readFile(path, 'utf8');
+      } catch {
+        // Ignore modules without a package.json file
+        return;
       }
+      packageJsons[modulePath] = JSON.parse(contents);
     }));
     return packageJsons;
   }
@@ -181,37 +189,37 @@ export class ModuleStateBuilder {
     if (packageJson['lsd:module'] === true) {
       packageJson['lsd:module'] = `https://linkedsoftwaredependencies.org/bundles/npm/${packageJson.name}`;
       const basePath = packageJson['lsd:basePath'] || '';
-      try {
-        if ((await fs.stat(Path.posix.join(packagePath, basePath, 'components/components.jsonld'))).isFile()) {
-          packageJson['lsd:components'] = `${basePath}components/components.jsonld`;
-        }
-      } catch {
-        // Ignore errors
-      }
       const baseIri = `${packageJson['lsd:module']}/^${semverMajor(packageJson.version)}.0.0/`;
-      try {
-        if ((await fs.stat(Path.posix.join(packagePath, basePath, 'components/context.jsonld'))).isFile()) {
-          packageJson['lsd:contexts'] = {
-            [`${baseIri}components/context.jsonld`]: `${basePath}components/context.jsonld`,
-          };
+      // Probe the file system in parallel instead of sequentially.
+      const probe = async(subPath: string, file: boolean): Promise<boolean> => {
+        try {
+          const stat = await fs.stat(Path.posix.join(packagePath, basePath, subPath));
+          return file ? stat.isFile() : stat.isDirectory();
+        } catch {
+          // Ignore errors
+          return false;
         }
-      } catch {
-        // Ignore errors
+      };
+      const [ hasComponents, hasContext, hasComponentsDir, hasConfigDir ] = await Promise.all([
+        probe('components/components.jsonld', true),
+        probe('components/context.jsonld', true),
+        probe('components', false),
+        probe('config', false),
+      ]);
+      if (hasComponents) {
+        packageJson['lsd:components'] = `${basePath}components/components.jsonld`;
+      }
+      if (hasContext) {
+        packageJson['lsd:contexts'] = {
+          [`${baseIri}components/context.jsonld`]: `${basePath}components/context.jsonld`,
+        };
       }
       packageJson['lsd:importPaths'] = {};
-      try {
-        if ((await fs.stat(Path.posix.join(packagePath, basePath, 'components'))).isDirectory()) {
-          packageJson['lsd:importPaths'][`${baseIri}components/`] = `${basePath}components/`;
-        }
-      } catch {
-        // Ignore errors
+      if (hasComponentsDir) {
+        packageJson['lsd:importPaths'][`${baseIri}components/`] = `${basePath}components/`;
       }
-      try {
-        if ((await fs.stat(Path.posix.join(packagePath, basePath, 'config'))).isDirectory()) {
-          packageJson['lsd:importPaths'][`${baseIri}config/`] = `${basePath}config/`;
-        }
-      } catch {
-        // Ignore errors
+      if (hasConfigDir) {
+        packageJson['lsd:importPaths'][`${baseIri}config/`] = `${basePath}config/`;
       }
       return true;
     }
