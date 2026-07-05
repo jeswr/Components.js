@@ -1,9 +1,10 @@
 import { createReadStream, promises as fs } from 'node:fs';
-import type { Readable } from 'node:stream';
+import { PassThrough, Readable } from 'node:stream';
 import type * as RDF from '@rdfjs/types';
 import type { ParseOptions } from 'rdf-parse';
 import { rdfParser } from 'rdf-parse';
 import type { Logger } from 'winston';
+import { isJsonLdFastPathCandidate, tryParseJsonLdFastPath } from './JsonLdFastPath';
 import { PrefetchedDocumentLoader } from './PrefetchedDocumentLoader';
 import { RdfStreamIncluder } from './RdfStreamIncluder';
 
@@ -11,6 +12,12 @@ import { RdfStreamIncluder } from './RdfStreamIncluder';
  * Parses a data stream to a triple stream.
  */
 export class RdfParser {
+  /**
+   * The maximum number of bytes {@link RdfParser.parseViaFastPath} may buffer.
+   * Documents larger than this cap are streamed through the generic parser.
+   */
+  public static fastPathBufferCap = 8 * 1_024 * 1_024;
+
   /**
    * Parses the given stream into RDF quads.
    * @param textStream A text stream.
@@ -57,11 +64,91 @@ export class RdfParser {
     };
 
     // Execute parsing
+    const includedQuadStream = new RdfStreamIncluder(options);
+    if (isJsonLdFastPathCandidate(options)) {
+      // Buffer the document and attempt the specialized JSON-LD fast path,
+      // falling back to the generic parser for anything outside its subset.
+      this.parseViaFastPath(textStream, options, includedQuadStream);
+    } else {
+      this.parseGeneric(textStream, options, includedQuadStream);
+    }
+    return includedQuadStream;
+  }
+
+  /**
+   * Parse the given stream with the generic parsing pipeline.
+   * @param textStream A text stream.
+   * @param options Parsing options.
+   * @param includedQuadStream The output stream.
+   */
+  protected parseGeneric(
+    textStream: NodeJS.ReadableStream,
+    options: RdfParserOptions,
+    includedQuadStream: RdfStreamIncluder,
+  ): void {
     const quadStream = rdfParser.parse(textStream, options);
-    const includedQuadStream = quadStream.pipe(new RdfStreamIncluder(options));
+    quadStream.pipe(includedQuadStream);
     quadStream.on('error', (error: Error) => includedQuadStream
       .emit('error', RdfParser.addPathToError(error, options.path)));
-    return includedQuadStream;
+  }
+
+  /**
+   * Buffer the given JSON-LD document stream, and parse it via {@link JsonLdFastPath} when possible,
+   * or via the generic parsing pipeline otherwise.
+   * @param textStream A text stream.
+   * @param options Parsing options.
+   * @param includedQuadStream The output stream.
+   */
+  protected parseViaFastPath(
+    textStream: NodeJS.ReadableStream,
+    options: RdfParserOptions,
+    includedQuadStream: RdfStreamIncluder,
+  ): void {
+    const chunks: (Buffer | string)[] = [];
+    let bufferedLength = 0;
+    let streamedThrough = false;
+    textStream.on('data', (chunk: Buffer | string) => {
+      if (streamedThrough) {
+        return;
+      }
+      chunks.push(chunk);
+      bufferedLength += chunk.length;
+      if (bufferedLength > RdfParser.fastPathBufferCap) {
+        // The document is too large to buffer; replay what was consumed and stream the rest
+        // directly into the generic parser.
+        streamedThrough = true;
+        const replayStream = new PassThrough();
+        for (const bufferedChunk of chunks) {
+          replayStream.write(bufferedChunk);
+        }
+        textStream.pipe(replayStream);
+        this.parseGeneric(replayStream, options, includedQuadStream);
+      }
+    });
+    textStream.on('error', (error: Error) => includedQuadStream
+      .emit('error', RdfParser.addPathToError(error, options.path)));
+    // eslint-disable-next-line ts/no-misused-promises
+    textStream.on('end', async() => {
+      if (streamedThrough) {
+        return;
+      }
+      try {
+        const text = Buffer
+          .concat(chunks.map(chunk => typeof chunk === 'string' ? Buffer.from(chunk, 'utf8') : chunk))
+          .toString('utf8');
+        const quads = await tryParseJsonLdFastPath(text, options);
+        if (quads) {
+          for (const quad of quads) {
+            includedQuadStream.write(quad);
+          }
+          includedQuadStream.end();
+        } else {
+          this.parseGeneric(Readable.from([ text ]), options, includedQuadStream);
+        }
+      } catch (error: unknown) {
+        includedQuadStream.emit('error', RdfParser.addPathToError(<Error> error, options.path));
+      }
+    });
   }
 
   /**
@@ -129,4 +216,9 @@ export type RdfParserOptions = ParseOptions & {
    * If allowed, only a warning is emitted.
    */
   remoteContextLookups?: boolean;
+  /**
+   * If the specialized JSON-LD fast path must be disabled,
+   * so that all documents are parsed with the generic parsing pipeline.
+   */
+  disableJsonLdFastPath?: boolean;
 };

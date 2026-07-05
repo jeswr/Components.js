@@ -39,6 +39,7 @@
     "@types/minimist": "^1.2.0",
     "@types/node": "^18.0.0",
     "@types/semver": "^7.3.4",
+    "canonicalize": "^1.0.8",
     "jsonld-context-parser": "^3.0.0",
     "minimist": "^1.2.0",
     "rdf-data-factory": "^2.0.2",
