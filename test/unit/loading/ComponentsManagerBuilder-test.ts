@@ -57,6 +57,16 @@ describe('ComponentsManagerBuilder', () => {
     jest.clearAllMocks();
   });
 
+  it('should honour remoteContextLookups independently of typeChecking', async() => {
+    const builder = new ComponentsManagerBuilder({
+      mainModulePath,
+      remoteContextLookups: true,
+      typeChecking: false,
+    });
+    const mgr = await builder.build();
+    expect((<any> mgr.configRegistry).remoteContextLookups).toBe(true);
+  });
+
   it('should build with default options', async() => {
     const componentsManagerBuilder = new ComponentsManagerBuilder({
       mainModulePath,
