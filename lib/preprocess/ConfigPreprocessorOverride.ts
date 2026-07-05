@@ -1,5 +1,6 @@
 import type { Resource } from 'rdf-object';
 import type { RdfObjectLoader } from 'rdf-object/lib/RdfObjectLoader';
+import { stringToTerm } from 'rdf-string';
 import type { Logger } from 'winston';
 import { IRIS_OO, PREFIX_OO } from '../rdf/Iris';
 import { uniqueTypes } from '../rdf/ResourceUtil';
@@ -110,8 +111,13 @@ export class ConfigPreprocessorOverride implements IConfigPreprocessor<Resource[
    * Finds all Override resources in the object loader and links them to their target resource.
    */
   protected* findOverrideTargets(): Iterable<{ override: Resource; target: Resource }> {
-    for (const [ id, resource ] of Object.entries(this.objectLoader.resources)) {
-      if (resource.isA(IRIS_OO.Override) && resource.value !== IRIS_OO.Override) {
+    // Convert the Override type IRI to a term once, instead of having `Resource#isA`
+    // re-expand the type string for every resource in the loader.
+    // Iterating over the keys also avoids materializing a [ key, value ] pair array per resource.
+    const overrideType = stringToTerm(IRIS_OO.Override);
+    for (const id of Object.keys(this.objectLoader.resources)) {
+      const resource = this.objectLoader.resources[id];
+      if (resource.isA(overrideType) && resource.value !== IRIS_OO.Override) {
         const targets = resource.properties[IRIS_OO.overrideInstance];
         if (!targets || targets.length === 0) {
           this.logger.warn(`Missing overrideInstance for ${id}. This Override will be ignored.`);
