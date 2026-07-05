@@ -52,9 +52,64 @@ jest.mock('../../../lib/loading/ModuleStateBuilder', () => ({
   },
 }));
 
+const moduleStateCache = {
+  load: jest.fn(),
+  save: jest.fn(),
+};
+// eslint-disable-next-line jest/no-untyped-mock-factory
+jest.mock('../../../lib/loading/ModuleStateCache', () => ({
+  // eslint-disable-next-line object-shorthand
+  ModuleStateCache: function() {
+    return moduleStateCache;
+  },
+}));
+
 describe('ComponentsManagerBuilder', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    moduleStateCache.load.mockResolvedValue(undefined);
+    moduleStateCache.save.mockResolvedValue(undefined);
+  });
+
+  it('should build from a fresh module state cache', async() => {
+    moduleStateCache.load.mockResolvedValue(dummyModuleState);
+    const builder = new ComponentsManagerBuilder({
+      mainModulePath,
+      moduleStateCachePath: '/tmp/module-state.json',
+    });
+    const mgr = await builder.build();
+    expect(mgr.moduleState).toBe(dummyModuleState);
+    expect(moduleStateCache.load).toHaveBeenCalledTimes(1);
+    expect(moduleStateCache.save).not.toHaveBeenCalled();
+  });
+
+  it('should build and persist on a stale module state cache', async() => {
+    const builder = new ComponentsManagerBuilder({
+      mainModulePath,
+      moduleStateCachePath: '/tmp/module-state.json',
+    });
+    const mgr = await builder.build();
+    expect(mgr.moduleState).toBe(dummyModuleState);
+    expect(moduleStateCache.load).toHaveBeenCalledTimes(1);
+    expect(moduleStateCache.save).toHaveBeenCalledTimes(1);
+    expect(moduleStateCache.save).toHaveBeenCalledWith(dummyModuleState);
+  });
+
+  it('should ignore the module state cache when a module state is provided', async() => {
+    const customModuleState = <any> {
+      mainModulePath,
+      componentModules: {},
+      nodeModulePaths: [],
+    };
+    const builder = new ComponentsManagerBuilder({
+      mainModulePath,
+      moduleState: customModuleState,
+      moduleStateCachePath: '/tmp/module-state.json',
+    });
+    const mgr = await builder.build();
+    expect(mgr.moduleState).toBe(customModuleState);
+    expect(moduleStateCache.load).not.toHaveBeenCalled();
+    expect(moduleStateCache.save).not.toHaveBeenCalled();
   });
 
   it('should build with default options', async() => {

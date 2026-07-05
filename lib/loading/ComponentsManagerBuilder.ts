@@ -20,6 +20,7 @@ import { ComponentRegistryFinalizer } from './ComponentRegistryFinalizer';
 import { ConfigRegistry } from './ConfigRegistry';
 import { ModuleStateBuilder } from './ModuleStateBuilder';
 import type { IModuleState } from './ModuleStateBuilder';
+import { ModuleStateCache } from './ModuleStateCache';
 
 /**
  * Builds {@link ComponentsManager}'s based on given options.
@@ -32,6 +33,7 @@ export class ComponentsManagerBuilder<TInstance = any> {
   private readonly dumpErrorState: boolean;
   private readonly logger: Logger;
   private readonly moduleState?: IModuleState;
+  private readonly moduleStateCachePath?: string;
   private readonly skipContextValidation: boolean;
   private readonly typeChecking: boolean;
   private readonly remoteContextLookups: boolean;
@@ -46,6 +48,7 @@ export class ComponentsManagerBuilder<TInstance = any> {
     this.dumpErrorState = options.dumpErrorState === undefined ? true : Boolean(options.dumpErrorState);
     this.logger = ComponentsManagerBuilder.createLogger(options.logLevel);
     this.moduleState = options.moduleState;
+    this.moduleStateCachePath = options.moduleStateCachePath;
     this.skipContextValidation = options.skipContextValidation === undefined ?
       true :
       Boolean(options.skipContextValidation);
@@ -85,14 +88,27 @@ export class ComponentsManagerBuilder<TInstance = any> {
    */
   public async build(): Promise<ComponentsManager<TInstance>> {
     // Initialize module state
-    let moduleState: IModuleState;
-    if (this.moduleState) {
-      moduleState = this.moduleState;
-    } else {
+    let moduleState: IModuleState | undefined = this.moduleState;
+    let moduleStateCache: ModuleStateCache | undefined;
+    if (!moduleState && this.moduleStateCachePath) {
+      moduleStateCache = new ModuleStateCache({
+        path: this.moduleStateCachePath,
+        mainModulePath: this.mainModulePath,
+        logger: this.logger,
+      });
+      moduleState = await moduleStateCache.load();
+      if (moduleState) {
+        this.logger.info(`Loaded component discovery state from ${this.moduleStateCachePath}`);
+      }
+    }
+    if (!moduleState) {
       this.logger.info(`Initiating component discovery from ${this.mainModulePath}`);
       moduleState = await new ModuleStateBuilder(this.logger)
         .buildModuleState(require, this.mainModulePath);
       this.logger.info(`Discovered ${Object.keys(moduleState.componentModules).length} component packages within ${moduleState.nodeModulePaths.length} packages`);
+      if (moduleStateCache) {
+        await moduleStateCache.save(moduleState);
+      }
     }
 
     // Initialize object loader with built-in context
@@ -212,6 +228,16 @@ export interface IComponentsManagerBuilderOptions<TInstance> {
    * Defaults to a newly created instances on the {@link mainModulePath}.
    */
   moduleState?: IModuleState;
+  /**
+   * A file path to persist the module state to, to skip component discovery on
+   * subsequent invocations. Ignored when {@link moduleState} is provided.
+   *
+   * The persisted state is invalidated when the componentsjs version, or the
+   * modification time or size of the main module's package.json, lock files, or
+   * node_modules directory changes. In-place modifications deep inside
+   * node_modules are NOT detected; remove the cache file manually in that case.
+   */
+  moduleStateCachePath?: string;
   /**
    * If JSON-LD context validation should be skipped.
    * Defaults to `true`.
