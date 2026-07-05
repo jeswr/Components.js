@@ -54,7 +54,7 @@ export class ComponentsManagerBuilder<TInstance = any> {
       Boolean(options.typeChecking);
     this.remoteContextLookups = options.remoteContextLookups === undefined ?
       false :
-      Boolean(options.typeChecking);
+      Boolean(options.remoteContextLookups);
   }
 
   public static createLogger(logLevel: LogLevel = 'warn'): Logger {
